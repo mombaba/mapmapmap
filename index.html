@@ -1,0 +1,163 @@
+<!doctype html>
+<html lang="ko">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+  <meta name="robots" content="noindex,nofollow,noarchive">
+  <meta name="googlebot" content="noindex,nofollow,noarchive,nosnippet,noimageindex">
+  <meta name="referrer" content="no-referrer">
+  <meta name="theme-color" content="#102a43">
+  <title>암호로 열기</title>
+  <style>
+    :root { color-scheme: light; font-family: Inter, ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif; }
+    * { box-sizing: border-box; }
+    html, body { min-height: 100%; }
+    body {
+      margin: 0; display: grid; place-items: center; min-height: 100vh; min-height: 100dvh;
+      padding: 24px; color: #102a43;
+      background: radial-gradient(circle at 20% 0%, #d9eaf2 0, transparent 36%), linear-gradient(145deg, #f7fafc, #e6eef4);
+    }
+    main { width: min(100%, 420px); padding: 32px; border: 1px solid rgb(16 42 67 / 12%); border-radius: 20px; background: rgb(255 255 255 / 92%); box-shadow: 0 18px 55px rgb(16 42 67 / 15%); }
+    .lock { display: grid; place-items: center; width: 48px; height: 48px; margin-bottom: 18px; border-radius: 14px; background: #eaf2f8; font-size: 25px; }
+    h1 { margin: 0 0 8px; font-size: 1.55rem; letter-spacing: -.02em; }
+    p { margin: 0 0 22px; color: #52677a; line-height: 1.55; }
+    label { display: block; margin-bottom: 8px; font-size: .9rem; font-weight: 700; }
+    input { width: 100%; min-height: 48px; padding: 11px 13px; border: 1px solid #b8c8d5; border-radius: 11px; background: #fff; color: #102a43; font: inherit; }
+    input:focus { outline: 3px solid rgb(37 117 168 / 18%); border-color: #2575a8; }
+    button { width: 100%; min-height: 48px; margin-top: 12px; border: 0; border-radius: 11px; background: #173f5f; color: #fff; font: inherit; font-weight: 800; cursor: pointer; }
+    button:hover { background: #0f334f; }
+    button:disabled { cursor: wait; opacity: .65; }
+    #status { min-height: 1.5em; margin: 14px 0 0; color: #52677a; font-size: .9rem; }
+    #status.error { color: #a32626; }
+    .spinner { display: inline-block; width: .9em; height: .9em; margin-right: 7px; border: 2px solid rgb(255 255 255 / 45%); border-top-color: #fff; border-radius: 50%; vertical-align: -.1em; animation: spin .8s linear infinite; }
+    @keyframes spin { to { transform: rotate(360deg); } }
+  </style>
+</head>
+<body>
+  <main>
+    <div class="lock" aria-hidden="true">🔒</div>
+    <h1>PIN이 필요한 페이지입니다</h1>
+    <p>4자리 PIN은 이 기기 안에서만 사용되며 서버로 전송되지 않습니다.</p>
+    <form id="unlock-form">
+      <label for="password">4자리 PIN</label>
+      <input id="password" name="password" type="password" inputmode="numeric" pattern="[0-9]{4}" minlength="4" maxlength="4" autocomplete="current-password" autocapitalize="none" spellcheck="false" required autofocus>
+      <button id="unlock-button" type="submit">열기</button>
+      <p id="status" role="status" aria-live="polite"></p>
+    </form>
+  </main>
+
+  <script>
+    (() => {
+      'use strict';
+
+      const form = document.getElementById('unlock-form');
+      const input = document.getElementById('password');
+      const button = document.getElementById('unlock-button');
+      const status = document.getElementById('status');
+      const encoder = new TextEncoder();
+
+      function setStatus(message, isError = false) {
+        status.textContent = message;
+        status.className = isError ? 'error' : '';
+      }
+
+      function fromBase64(value, label) {
+        if (typeof value !== 'string' || !/^[A-Za-z0-9+/]*={0,2}$/.test(value)) throw new Error(label + ' 형식이 올바르지 않습니다.');
+        let binary;
+        try { binary = atob(value); } catch { throw new Error(label + ' 형식이 올바르지 않습니다.'); }
+        const bytes = new Uint8Array(binary.length);
+        for (let i = 0; i < binary.length; i += 1) bytes[i] = binary.charCodeAt(i);
+        return bytes;
+      }
+
+      function validateEnvelope(envelope) {
+        if (!envelope || envelope.format !== 'locked-html' || envelope.version !== 1) throw new Error('지원하지 않는 암호화 파일입니다.');
+        if (!envelope.kdf || envelope.kdf.name !== 'PBKDF2' || envelope.kdf.hash !== 'SHA-256') throw new Error('지원하지 않는 키 생성 방식입니다.');
+        if (!Number.isInteger(envelope.kdf.iterations) || envelope.kdf.iterations < 100000 || envelope.kdf.iterations > 2000000) throw new Error('암호화 반복 횟수가 안전 범위를 벗어났습니다.');
+        if (!envelope.cipher || envelope.cipher.name !== 'AES-GCM' || envelope.cipher.tagLength !== 128) throw new Error('지원하지 않는 암호화 방식입니다.');
+        return {
+          salt: fromBase64(envelope.kdf.salt, 'salt'),
+          iv: fromBase64(envelope.cipher.iv, 'iv'),
+          encrypted: fromBase64(envelope.data, 'data')
+        };
+      }
+
+      function aadFor(envelope) {
+        return encoder.encode([
+          envelope.format, envelope.version, envelope.kdf.name, envelope.kdf.hash,
+          envelope.kdf.iterations, envelope.cipher.name, envelope.cipher.tagLength
+        ].join('|'));
+      }
+
+      function ensureNoIndex(html) {
+        if (/<meta\s+[^>]*name=["']robots["']/i.test(html)) return html;
+        return html.replace(/<head(\s[^>]*)?>/i, match => match + '\n  <meta name="robots" content="noindex,nofollow,noarchive">');
+      }
+
+      async function loadEnvelope() {
+        const response = await fetch('./game.enc', { cache: 'no-store', credentials: 'same-origin' });
+        if (!response.ok) throw new Error('game.enc 파일을 불러오지 못했습니다. 업로드 여부를 확인하세요.');
+        const text = await response.text();
+        if (text.length > 30000000) throw new Error('암호화 파일이 너무 큽니다.');
+        try { return JSON.parse(text); } catch { throw new Error('game.enc 파일 형식이 올바르지 않습니다.'); }
+      }
+
+      async function unlock(password) {
+        const envelope = await loadEnvelope();
+        const { salt, iv, encrypted } = validateEnvelope(envelope);
+        if (salt.length !== 16 || iv.length !== 12 || encrypted.length < 17) throw new Error('암호화 파일이 손상되었습니다.');
+
+        const passwordBytes = encoder.encode(password.normalize('NFKC'));
+        try {
+          const keyMaterial = await crypto.subtle.importKey('raw', passwordBytes, 'PBKDF2', false, ['deriveKey']);
+          const key = await crypto.subtle.deriveKey(
+            { name: 'PBKDF2', hash: 'SHA-256', salt, iterations: envelope.kdf.iterations },
+            keyMaterial,
+            { name: 'AES-GCM', length: 256 },
+            false,
+            ['decrypt']
+          );
+          const clearBytes = await crypto.subtle.decrypt(
+            { name: 'AES-GCM', iv, additionalData: aadFor(envelope), tagLength: 128 },
+            key,
+            encrypted
+          );
+          const html = new TextDecoder('utf-8', { fatal: true }).decode(clearBytes);
+          if (!/<html(?:\s|>)/i.test(html)) throw new Error('복호화된 내용이 HTML이 아닙니다.');
+          return ensureNoIndex(html);
+        } finally {
+          passwordBytes.fill(0);
+        }
+      }
+
+      form.addEventListener('submit', async event => {
+        event.preventDefault();
+        if (!window.crypto || !crypto.subtle) {
+          setStatus('이 브라우저에서는 보안 복호화를 사용할 수 없습니다. 최신 Chrome, Edge, Safari 또는 Firefox를 사용하세요.', true);
+          return;
+        }
+
+        button.disabled = true;
+        button.innerHTML = '<span class="spinner" aria-hidden="true"></span>여는 중…';
+        setStatus('PIN을 확인하고 있습니다…');
+        try {
+          const html = await unlock(input.value);
+          input.value = '';
+          document.open();
+          document.write(html);
+          document.close();
+        } catch (error) {
+          console.error(error);
+          input.value = '';
+          input.focus();
+          setStatus(error instanceof DOMException && error.name === 'OperationError'
+            ? 'PIN이 틀렸거나 game.enc 파일이 손상되었습니다.'
+            : (error.message || '페이지를 열 수 없습니다.'), true);
+          button.disabled = false;
+          button.textContent = '다시 시도';
+        }
+      });
+    })();
+  </script>
+</body>
+</html>
